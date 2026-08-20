@@ -1,83 +1,157 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { useParams } from "next/navigation";
-import Link from "next/link";
-import { ArrowLeft, RefreshCw, AlertCircle } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { AlertCircle, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { RiskMetricsCards } from "@/components/asset/RiskMetricsCards";
-import { PriceChart } from "@/components/asset/PriceChart";
-import { DrawdownChart } from "@/components/asset/DrawdownChart";
-import { getHistoricalPrices } from "@/lib/data/marketDataService";
+import { Card, CardContent } from "@/components/ui/card";
+import { AddPositionForm } from "@/components/portfolio/AddPositionForm";
+import { PositionList } from "@/components/portfolio/PositionList";
+import { PortfolioRiskCards } from "@/components/portfolio/PortfolioRiskCards";
+import { usePortfolioStore } from "@/lib/store/portfolioStore";
+import { getHistoricalPrices, getCurrentPrice } from "@/lib/data/marketDataService";
 import {
   calculateReturns,
   calculateVolatility,
-  calculateParametricVaR,
   calculateHistoricalVaR,
   calculateDrawdowns,
   calculateSharpeRatio,
   calculateBeta,
+  calculateHHI,
 } from "@/lib/calculations/risk";
-import { RiskMetrics, PricePoint } from "@/types";
-import { formatCurrency, formatPercent, cn } from "@/lib/utils/helpers";
+import { PortfolioRiskMetrics, PricePoint, PositionRisk } from "@/types";
 
 const SPY_TICKER = "SPY";
 
-export default function AssetPage() {
-  const params = useParams();
-  const ticker = (params.ticker as string)?.toUpperCase() || "";
-
-  const [prices, setPrices] = useState<PricePoint[]>([]);
-  const [spyPrices, setSpyPrices] = useState<PricePoint[]>([]);
-  const [metrics, setMetrics] = useState<RiskMetrics | null>(null);
+export default function PortfolioPage() {
+  const positions = usePortfolioStore((s) => s.positions);
+  const [prices, setPrices] = useState<Record<string, number>>({});
+  const [metrics, setMetrics] = useState<PortfolioRiskMetrics | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [period, setPeriod] = useState<string>("1year");
 
   const loadData = useCallback(async () => {
-    if (!ticker) return;
+    if (positions.length === 0) {
+      setMetrics(null);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
-      const [assetData, spyData] = await Promise.all([
-        getHistoricalPrices(ticker, period),
-        getHistoricalPrices(SPY_TICKER, period),
-      ]);
+      const tickers = positions.map((p) => p.ticker);
+      const priceMap: Record<string, number> = {};
 
-      setPrices(assetData);
-      setSpyPrices(spyData);
+      // Fetch current prices
+      await Promise.all(
+        tickers.map(async (t) => {
+          try {
+            const price = await getCurrentPrice(t);
+            priceMap[t] = price;
+          } catch {
+            priceMap[t] = 0;
+          }
+        })
+      );
+      setPrices(priceMap);
 
-      const returns = calculateReturns(assetData);
-      const spyReturns = calculateReturns(spyData);
-      const { maxDrawdown, drawdownSeries, cumulativeReturns } = calculateDrawdowns(assetData);
-      const volatility = calculateVolatility(returns);
-      const var95 = calculateHistoricalVaR(returns, 0.95);
-      const var99 = calculateHistoricalVaR(returns, 0.99);
-      const sharpe = calculateSharpeRatio(returns);
-      const beta = calculateBeta(returns, spyReturns);
-      const currentPrice = assetData[assetData.length - 1]?.close || 0;
+      // Fetch historical prices for all positions + SPY
+      const allTickers = [...tickers, SPY_TICKER];
+      const histData: Record<string, PricePoint[]> = {};
+      await Promise.all(
+        allTickers.map(async (t) => {
+          try {
+            histData[t] = await getHistoricalPrices(t, "1year");
+          } catch {
+            histData[t] = [];
+          }
+        })
+      );
+
+      // Calculate position-level metrics
+      const positionRisks: PositionRisk[] = [];
+      const dataLengths = Object.values(histData).map((d) => d.length).filter((l) => l > 0);
+      const minLen = dataLengths.length > 0 ? Math.min(...dataLengths) : 0;
+      const spyReturns = calculateReturns(histData[SPY_TICKER] || []);
+      const portfolioReturns: number[] = [];
+      let totalValue = 0;
+
+      positions.forEach((pos) => {
+        const data = histData[pos.ticker] || [];
+        const price = priceMap[pos.ticker] || 0;
+        const value = price * pos.shares;
+        totalValue += value;
+
+        const returns = calculateReturns(data);
+        const volatility = calculateVolatility(returns);
+        const beta = calculateBeta(returns, spyReturns);
+        positionRisks.push({
+          ticker: pos.ticker,
+          value,
+          weight: 0,
+          volatility,
+          beta,
+          contribution: 0,
+        });
+      });
+
+      // Recalculate weights
+      positionRisks.forEach((p) => {
+        p.weight = totalValue > 0 ? p.value / totalValue : 0;
+      });
+
+      // Portfolio returns (value-weighted)
+      const alignedReturns: number[][] = [];
+      positions.forEach((pos) => {
+        const data = histData[pos.ticker] || [];
+        const returns = calculateReturns(data);
+        alignedReturns.push(returns.slice(-minLen + 1));
+      });
+
+      for (let i = 0; i < (alignedReturns[0]?.length || 0); i++) {
+        let dailyReturn = 0;
+        positions.forEach((pos, idx) => {
+          const weight = positionRisks[idx].weight;
+          dailyReturn += (alignedReturns[idx][i] || 0) * weight;
+        });
+        portfolioReturns.push(dailyReturn);
+      }
+
+      // Portfolio-level metrics
+      const volatility = calculateVolatility(portfolioReturns);
+      const var95 = calculateHistoricalVaR(portfolioReturns, 0.95);
+      const var99 = calculateHistoricalVaR(portfolioReturns, 0.99);
+      const sharpe = calculateSharpeRatio(portfolioReturns);
+      const beta = calculateBeta(portfolioReturns, spyReturns);
+
+      // Approximate drawdown from portfolio returns
+      let cumulative = 0;
+      let peak = 0;
+      let maxDrawdown = 0;
+      portfolioReturns.forEach((r) => {
+        cumulative += r;
+        if (cumulative > peak) peak = cumulative;
+        const dd = cumulative - peak;
+        if (dd < maxDrawdown) maxDrawdown = dd;
+      });
+
+      const hhi = calculateHHI(positionRisks.map((p) => p.weight));
 
       setMetrics({
+        totalValue,
         volatility,
         var95,
         var99,
         maxDrawdown,
         sharpeRatio: sharpe,
         beta,
-        currentPrice,
-        returns,
-        cumulativeReturns,
-        drawdownSeries,
+        concentrationHHI: hhi,
+        positionRisks,
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load data");
+      setError(err instanceof Error ? err.message : "Failed to calculate portfolio risk");
     } finally {
       setLoading(false);
     }
-  }, [ticker, period]);
+  }, [positions]);
 
   useEffect(() => {
     loadData();
@@ -85,41 +159,19 @@ export default function AssetPage() {
 
   return (
     <div className="space-y-4 py-2">
-      {/* Header */}
-      <div className="flex items-center gap-3">
-        <Link href="/">
-          <Button variant="ghost" size="icon" className="shrink-0">
-            <ArrowLeft className="h-5 w-5" />
-          </Button>
-        </Link>
-        <div className="flex-1 min-w-0">
-          <h1 className="text-xl font-bold truncate">{ticker}</h1>
-          {metrics && (
-            <p className="text-sm text-muted-foreground">
-              ${metrics.currentPrice.toFixed(2)} · {prices.length} days
-            </p>
-          )}
-        </div>
+      <div className="flex items-center justify-between">
+        <h1 className="text-xl font-bold">Portfolio Risk</h1>
         <Button
           variant="ghost"
           size="icon"
           onClick={loadData}
           disabled={loading}
-          className="shrink-0"
         >
-          <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
+          <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
         </Button>
       </div>
 
-      {/* Period selector */}
-      <Tabs value={period} onValueChange={setPeriod}>
-        <TabsList className="grid w-full grid-cols-4">
-          <TabsTrigger value="1month">1M</TabsTrigger>
-          <TabsTrigger value="3months">3M</TabsTrigger>
-          <TabsTrigger value="6months">6M</TabsTrigger>
-          <TabsTrigger value="1year">1Y</TabsTrigger>
-        </TabsList>
-      </Tabs>
+      <AddPositionForm />
 
       {error && (
         <Card className="border-destructive">
@@ -130,91 +182,24 @@ export default function AssetPage() {
         </Card>
       )}
 
-      {loading && !metrics && (
-        <div className="space-y-3">
-          <div className="h-8 w-32 bg-muted rounded animate-pulse" />
-          <div className="grid grid-cols-2 gap-3">
-            {Array.from({ length: 6 }).map((_, i) => (
-              <div key={i} className="h-24 bg-muted rounded-lg animate-pulse" />
-            ))}
-          </div>
-        </div>
-      )}
+      <PositionList prices={prices} />
 
       {metrics && (
         <>
-          {/* Price Chart */}
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm">Price History</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <PriceChart prices={prices} />
-            </CardContent>
-          </Card>
-
-          {/* Metrics */}
-          <RiskMetricsCards metrics={metrics} ticker={ticker} />
-
-          {/* Drawdown Chart */}
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm">Drawdown</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <DrawdownChart
-                dates={prices.map((p) => p.date)}
-                drawdowns={metrics.drawdownSeries}
-              />
-            </CardContent>
-          </Card>
-
-          {/* Returns Distribution */}
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm">Daily Returns Distribution</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <ReturnsDistribution returns={metrics.returns} />
-            </CardContent>
-          </Card>
+          <div className="text-xs text-muted-foreground text-center">
+            HHI Concentration: {metrics.concentrationHHI.toFixed(3)} (
+            {metrics.concentrationHHI < 0.15
+              ? "Diversified"
+              : metrics.concentrationHHI < 0.25
+              ? "Moderate"
+              : metrics.concentrationHHI < 0.35
+              ? "Concentrated"
+              : "Highly Concentrated"}
+            )
+          </div>
+          <PortfolioRiskCards metrics={metrics} />
         </>
       )}
-    </div>
-  );
-}
-
-function ReturnsDistribution({ returns }: { returns: number[] }) {
-  if (returns.length === 0) return null;
-
-  const bins = 30;
-  const min = Math.min(...returns);
-  const max = Math.max(...returns);
-  const binWidth = (max - min) / bins || 1;
-  const histogram = new Array(bins).fill(0);
-
-  returns.forEach((r) => {
-    const idx = Math.min(Math.floor((r - min) / binWidth), bins - 1);
-    histogram[idx]++;
-  });
-
-  const data = histogram.map((count, i) => ({
-    bin: `${((min + i * binWidth) * 100).toFixed(1)}%`,
-    count,
-  }));
-
-  const maxCount = Math.max(...histogram);
-
-  return (
-    <div className="h-40 w-full flex items-end gap-0.5 px-1">
-      {data.map((d, i) => (
-        <div
-          key={i}
-          className="flex-1 bg-primary/60 rounded-t-sm min-w-[2px]"
-          style={{ height: `${(d.count / maxCount) * 100}%` }}
-          title={`${d.bin}: ${d.count} days`}
-        />
-      ))}
     </div>
   );
 }
